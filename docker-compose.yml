@@ -1,0 +1,169 @@
+services:
+  postgres:
+    image: postgres:16-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: oblihub
+      POSTGRES_USER: oblihub
+      POSTGRES_PASSWORD: ${DB_PASSWORD:-changeme}
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U oblihub"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+      start_period: 60s
+
+  # Tailscale sidecar. Opt-in via the "tailscale" compose profile:
+  #   docker compose --profile tailscale up -d
+  # Provide TAILSCALE_AUTHKEY (one-shot or reusable) and TAILSCALE_HOSTNAME in .env.
+  # When enabled, the server + proxy join your private Tailnet and can reach remote
+  # Docker engines / advertised subnets directly. When the profile is omitted the
+  # sidecar is never started and everything keeps working with public IPs / SSH.
+  tailscale:
+    image: tailscale/tailscale:latest
+    hostname: ${TAILSCALE_HOSTNAME:-oblihub}
+    restart: unless-stopped
+    profiles: [tailscale]
+    environment:
+      TS_AUTHKEY: ${TAILSCALE_AUTHKEY:-}
+      TS_HOSTNAME: ${TAILSCALE_HOSTNAME:-oblihub}
+      TS_STATE_DIR: /var/lib/tailscale
+      TS_USERSPACE: "false"
+      TS_EXTRA_ARGS: ${TAILSCALE_EXTRA_ARGS:-}
+      TS_ACCEPT_DNS: "true"
+      TS_SOCKET: /var/run/tailscale/tailscaled.sock
+    volumes:
+      - tailscale_state:/var/lib/tailscale
+      - tailscale_run:/var/run/tailscale
+      - /dev/net/tun:/dev/net/tun
+    cap_add:
+      - NET_ADMIN
+      - SYS_MODULE
+    healthcheck:
+      test: ["CMD", "tailscale", "status", "--peers=false"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 30s
+
+  server:
+    image: meejay/oblihub-server:${OBLIHUB_VERSION:-latest}
+    restart: unless-stopped
+    depends_on:
+      postgres:
+        condition: service_healthy
+    networks:
+      - default
+      - proxy
+    environment:
+      NODE_ENV: ${NODE_ENV:-production}
+      PORT: 3001
+      DATABASE_URL: postgres://oblihub:${DB_PASSWORD:-changeme}@postgres:5432/oblihub
+      SESSION_SECRET: ${SESSION_SECRET:-change-this-in-production}
+      CLIENT_ORIGIN: ${CLIENT_ORIGIN:-http://localhost}
+      # Obligate SSO (optional; empty = Settings / defaults) — see .env.example
+      APP_URL: ${APP_URL:-}
+      OBLIGATE_INBOUND_SECRET: ${OBLIGATE_INBOUND_SECRET:-}
+      DEFAULT_ADMIN_USERNAME: ${DEFAULT_ADMIN_USERNAME:-admin}
+      DEFAULT_ADMIN_PASSWORD: ${DEFAULT_ADMIN_PASSWORD:-admin123}
+      DOCKER_SOCKET: /var/run/docker.sock
+      ALLOW_CONSOLE: ${ALLOW_CONSOLE:-false}
+      ALLOW_STACK: ${ALLOW_STACK:-false}
+      ALLOW_NGINX: ${ALLOW_NGINX:-false}
+      STACKS_DIR: /data/stacks
+      APP_NAME: ${APP_NAME:-Oblihub}
+      DISCOVERY_INTERVAL: ${DISCOVERY_INTERVAL:-30000}
+      DEFAULT_CHECK_INTERVAL: ${DEFAULT_CHECK_INTERVAL:-60}
+      # Docker Hub auth — raises the rate limit from 100/6h (anonymous, per-IP) to 200/6h
+      # (free account) or unlimited (Pro/Team). Use an access token, not your password.
+      DOCKERHUB_USERNAME: ${DOCKERHUB_USERNAME:-}
+      DOCKERHUB_TOKEN: ${DOCKERHUB_TOKEN:-}
+      # Multi-engine Resources (optional; empty = built-in default). OBLIHUB_AGENT_IMAGE must be a glibc image
+      # you trust: Oblihub's one-shot helpers run it with CAP_SYS_ADMIN to set GPU power limits.
+      OBLIHUB_AGENT_IMAGE: ${OBLIHUB_AGENT_IMAGE:-}
+      OBLIHUB_AGENT_INTERVAL: ${OBLIHUB_AGENT_INTERVAL:-}
+      OBLIHUB_COMPOSE_PROJECT: ${OBLIHUB_COMPOSE_PROJECT:-}
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+      # Stacks directory — bind mount so the operator can inspect / edit compose files
+      # over ssh without exec-ing into the container. The default `/data/stacks` matches the
+      # in-container `STACKS_DIR` env above, keeping paths symmetric between host and container
+      # (docker compose labels containers with `working_dir` at start, so this symmetry avoids
+      # broken labels the moment you exec `docker inspect` from the host).
+      # Override with `STACKS_HOST_DIR=/some/where` in your .env if `/data/stacks` doesn't fit.
+      - ${STACKS_HOST_DIR:-/data/stacks}:/data/stacks
+      # `_proxy` stays as a named volume — nginx config + logs are Oblihub-managed and don't
+      # normally need to be edited from host. Exec into `oblihub-proxy-1` for a tail/cat.
+      - proxy_data:/data/stacks/_proxy
+      # Tailscale LocalAPI socket — read-only is enough for status queries.
+      # The volume is always declared but only populated when the tailscale
+      # profile is active. Server gracefully degrades when the socket is absent.
+      - tailscale_run:/var/run/tailscale:ro
+
+  client:
+    image: meejay/oblihub-client:${OBLIHUB_VERSION:-latest}
+    restart: unless-stopped
+    depends_on:
+      server:
+        condition: service_healthy
+    networks:
+      - default
+      - proxy
+    ports:
+      - "${LISTEN_PORT:-3100}:80"
+      - "${LISTEN_PORT_HTTPS:-3101}:443"
+    volumes:
+      - client_ssl:/etc/nginx/ssl
+
+  proxy:
+    image: nginx:alpine
+    restart: unless-stopped
+    labels:
+      oblihub.proxy: "true"
+    ports:
+      - "${PROXY_HTTP_PORT:-80}:80"
+      - "${PROXY_HTTPS_PORT:-443}:443"
+    # `proxy` network is shared with every managed stack Oblihub deploys — that's how
+    # nginx resolves forward_host = "<service-name>" via Docker DNS without published
+    # ports. The server worker also auto-attaches new managed stack containers to this
+    # network at deploy time.
+    networks:
+      - default
+      - proxy
+    volumes:
+      - proxy_data:/etc/nginx
+    entrypoint: ["/bin/sh", "-c", "mkdir -p /etc/nginx/conf.d /etc/nginx/stream.d /etc/nginx/certs /etc/nginx/acme-challenge /etc/nginx/htpasswd && [ -f /etc/nginx/nginx.conf ] || echo 'events { worker_connections 1024; } http { server { listen 80 default_server; location / { return 444; } } }' > /etc/nginx/nginx.conf && exec nginx -g 'daemon off;'"]
+    healthcheck:
+      test: ["CMD", "nginx", "-t"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+
+networks:
+  # Shared bridge network for the Oblihub proxy + every managed stack it deploys.
+  #
+  # Marked EXTERNAL so Compose never touches it: without `external: true` any subsequent
+  # `docker compose up -d` on Oblihub (e.g. an image bump) can decide to recreate the network,
+  # which detaches every container from every OTHER stack that had joined it. All front-ends
+  # served via oblihub-proxy would go dark until manually re-attached.
+  #
+  # Bootstrap is handled by the server on boot via `ensureProxyNetwork` (docker.service.ts) —
+  # `docker network inspect proxy || docker network create proxy`. So a fresh install works
+  # without any pre-step; Compose simply refuses to start if the network is missing, at which
+  # point the operator either runs `docker network create proxy` or lets the server create it
+  # (start server manually first, then start proxy).
+  #
+  # Other stacks reference this from their own compose as:
+  #   networks: { proxy: { external: true, name: proxy } }
+  proxy:
+    name: proxy
+    external: true
+
+volumes:
+  postgres_data:
+  proxy_data:
+  client_ssl:
+  tailscale_state:
+  tailscale_run:

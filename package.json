@@ -1,0 +1,12 @@
+{
+  "name": "oblihub",
+  "private": true,
+  "version": "0.1.0",
+  "description": "Self-hosted Docker Update Manager",
+  "workspaces": ["shared", "server", "client"],
+  "scripts": {
+    "build:shared": "cd shared && npx tsc",
+    "build:server": "cd server && npx tsc",
+    "build:client": "cd client && npx vite build"
+  }
+}

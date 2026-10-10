@@ -1,0 +1,56 @@
+# Use this compose file if you already have PostgreSQL running.
+# Usage: docker compose -f docker-compose.external-db.yml up -d
+#
+# Required .env variables:
+#   DATABASE_URL=postgres://oblihub:<password>@<host>:5432/oblihub
+#   SESSION_SECRET=<random-string>
+
+services:
+  server:
+    image: meejay/oblihub-server:${OBLIHUB_VERSION:-latest}
+    restart: unless-stopped
+    environment:
+      NODE_ENV: ${NODE_ENV:-production}
+      PORT: 3001
+      DATABASE_URL: ${DATABASE_URL}
+      SESSION_SECRET: ${SESSION_SECRET}
+      CLIENT_ORIGIN: ${CLIENT_ORIGIN:-http://localhost}
+      # Obligate SSO (optional; empty = Settings / defaults) — see .env.example
+      APP_URL: ${APP_URL:-}
+      OBLIGATE_INBOUND_SECRET: ${OBLIGATE_INBOUND_SECRET:-}
+      DEFAULT_ADMIN_USERNAME: ${DEFAULT_ADMIN_USERNAME:-admin}
+      DEFAULT_ADMIN_PASSWORD: ${DEFAULT_ADMIN_PASSWORD:-admin123}
+      DOCKER_SOCKET: /var/run/docker.sock
+      ALLOW_CONSOLE: ${ALLOW_CONSOLE:-false}
+      ALLOW_STACK: ${ALLOW_STACK:-false}
+      ALLOW_NGINX: ${ALLOW_NGINX:-false}
+      STACKS_DIR: /data/stacks
+      APP_NAME: ${APP_NAME:-Oblihub}
+      DISCOVERY_INTERVAL: ${DISCOVERY_INTERVAL:-30000}
+      DEFAULT_CHECK_INTERVAL: ${DEFAULT_CHECK_INTERVAL:-60}
+      # Multi-engine Resources (optional; empty = built-in default). OBLIHUB_AGENT_IMAGE must be a glibc image
+      # you trust: Oblihub's one-shot helpers run it with CAP_SYS_ADMIN to set GPU power limits.
+      OBLIHUB_AGENT_IMAGE: ${OBLIHUB_AGENT_IMAGE:-}
+      OBLIHUB_AGENT_INTERVAL: ${OBLIHUB_AGENT_INTERVAL:-}
+      OBLIHUB_COMPOSE_PROJECT: ${OBLIHUB_COMPOSE_PROJECT:-}
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+      # See main docker-compose.yml — bind mount for host-visible stack files.
+      - ${STACKS_HOST_DIR:-/data/stacks}:/data/stacks
+      - proxy_data:/data/stacks/_proxy
+
+  client:
+    image: meejay/oblihub-client:${OBLIHUB_VERSION:-latest}
+    restart: unless-stopped
+    depends_on:
+      server:
+        condition: service_healthy
+    ports:
+      - "${LISTEN_PORT:-3100}:80"
+      - "${LISTEN_PORT_HTTPS:-3101}:443"
+    volumes:
+      - client_ssl:/etc/nginx/ssl
+
+volumes:
+  proxy_data:
+  client_ssl:
